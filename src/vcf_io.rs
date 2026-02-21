@@ -64,6 +64,7 @@ pub const INFO_CHILD_REF: &str = "KMER_CHILD_REF";
 pub const INFO_MOTHER_ALT: &str = "KMER_MOTHER_ALT";
 pub const INFO_FATHER_ALT: &str = "KMER_FATHER_ALT";
 pub const INFO_STATUS: &str = "KMER_STATUS";
+pub const INFO_PROBAND_UNIQUE: &str = "KMER_PROBAND_UNIQUE";
 
 /// Per-variant annotation result.
 #[derive(Debug, Clone)]
@@ -75,6 +76,7 @@ pub struct VariantAnnotation {
     pub child_ref: i32,
     pub mother_alt: i32,
     pub father_alt: i32,
+    pub proband_unique: i32,
     pub status: String,
 }
 
@@ -167,6 +169,13 @@ pub fn write_annotated_vcf(
         )
         .as_bytes(),
     );
+    header.push_record(
+        format!(
+            "##INFO=<ID={},Number=1,Type=Integer,Description=\"Number of proband-unique k-mers overlapping this position (not found in parents)\">",
+            INFO_PROBAND_UNIQUE
+        )
+        .as_bytes(),
+    );
 
     let mut writer = bcf::Writer::from_path(output_vcf, &header, false, bcf::Format::Vcf)?;
 
@@ -208,6 +217,7 @@ pub fn write_annotated_vcf(
             new_record.push_info_integer(INFO_MOTHER_ALT.as_bytes(), &[ann.mother_alt])?;
             new_record.push_info_integer(INFO_FATHER_ALT.as_bytes(), &[ann.father_alt])?;
             new_record.push_info_string(INFO_STATUS.as_bytes(), &[ann.status.as_bytes()])?;
+            new_record.push_info_integer(INFO_PROBAND_UNIQUE.as_bytes(), &[ann.proband_unique])?;
 
             // Set FILTER
             let filter_id = writer.header().name_to_id(ann.filter.as_bytes())?;

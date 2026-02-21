@@ -45,6 +45,8 @@ struct VariantKmerInfo {
     alt_kmer_set: AHashSet<Vec<u8>>,
     /// Canonical REF-unique k-mers for this variant
     ref_kmer_set: AHashSet<Vec<u8>>,
+    /// All distinct canonical k-mers from child reads at this variant (reference-free)
+    child_read_kmers: AHashSet<Vec<u8>>,
     /// Whether all ALT k-mers are low complexity
     low_complexity: bool,
     /// Whether variant type/size is unsupported
@@ -58,6 +60,7 @@ struct ScoreResult {
     child_ref_count: u32,
     mother_alt_count: u32,
     father_alt_count: u32,
+    proband_unique: u32,
     low_complexity: bool,
     not_implemented: bool,
 }
@@ -88,6 +91,7 @@ fn build_all_variant_kmers(
                     ref_allele_len: var.ref_allele.len(),
                     alt_kmer_set: AHashSet::new(),
                     ref_kmer_set: AHashSet::new(),
+                    child_read_kmers: AHashSet::new(),
                     low_complexity: false,
                     not_implemented: true,
                 });
@@ -106,6 +110,7 @@ fn build_all_variant_kmers(
                 ref_allele_len: var.ref_allele.len(),
                 alt_kmer_set: alt_set,
                 ref_kmer_set: ref_set,
+                child_read_kmers: AHashSet::new(),
                 low_complexity,
                 not_implemented: false,
             });
@@ -209,18 +214,61 @@ pub fn run_filter(
     }
 
     info!("Building haplotype k-mers for {} variants...", variants.len());
-    let var_infos = build_all_variant_kmers(&variants, ref_path, config)?;
+    let mut var_infos = build_all_variant_kmers(&variants, ref_path, config)?;
+
+    // Phase 1.5: Extract all k-mers from child reads per variant (reference-free).
+    // This enables RUFUS-like proband-unique k-mer annotation: k-mers present
+    // in the child's reads but absent from both parents.
+    info!("Extracting child read k-mers per variant (reference-free)...");
+    for vi in var_infos.iter_mut() {
+        if vi.not_implemented || vi.low_complexity {
+            continue;
+        }
+        let start = (vi.pos - config.window as i64).max(0);
+        let end = vi.pos + vi.ref_allele_len as i64 + config.window as i64;
+
+        match counter::extract_all_kmers_in_region(
+            child_bam,
+            ref_path,
+            &vi.chrom,
+            start,
+            end,
+            config.kmer_size,
+            config.min_mapq,
+            config.min_baseq,
+            config.max_reads_per_locus,
+        ) {
+            Ok(kmers) => {
+                vi.child_read_kmers = kmers;
+            }
+            Err(e) => {
+                warn!(
+                    "Child k-mer extraction error for {}:{}: {}",
+                    vi.chrom,
+                    vi.pos + 1,
+                    e
+                );
+            }
+        }
+    }
 
     // Phase 2: Whole-file parent scanning (aligner-agnostic)
-    // Collect ALL ALT k-mers from all variants into one set for efficient batched scanning.
-    let all_alt_kmers: AHashSet<Vec<u8>> = var_infos
+    // Collect ALL ALT k-mers plus ALL child read k-mers into one set for
+    // efficient batched scanning. This supports both existing ALT-based filtering
+    // and the new proband-unique k-mer annotation.
+    let all_target_kmers: AHashSet<Vec<u8>> = var_infos
         .iter()
         .filter(|vi| !vi.low_complexity && !vi.not_implemented)
-        .flat_map(|vi| vi.alt_kmer_set.iter().cloned())
+        .flat_map(|vi| {
+            vi.alt_kmer_set
+                .iter()
+                .chain(vi.child_read_kmers.iter())
+                .cloned()
+        })
         .collect();
     info!(
-        "Collected {} unique ALT k-mers for parent scanning",
-        all_alt_kmers.len()
+        "Collected {} unique target k-mers for parent scanning (ALT + child read k-mers)",
+        all_target_kmers.len()
     );
 
     // Scan each parent's entire BAM/CRAM in ONE pass. No mapQ filter is applied
@@ -229,12 +277,12 @@ pub fn run_filter(
     let mother_kmer_counts = counter::count_kmers_whole_file(
         mother_bam,
         ref_path,
-        &all_alt_kmers,
+        &all_target_kmers,
         config.kmer_size,
         config.min_baseq,
     )?;
     info!(
-        "Mother scan complete: found {} distinct ALT k-mers in reads",
+        "Mother scan complete: found {} distinct target k-mers in reads",
         mother_kmer_counts.len()
     );
 
@@ -242,12 +290,12 @@ pub fn run_filter(
     let father_kmer_counts = counter::count_kmers_whole_file(
         father_bam,
         ref_path,
-        &all_alt_kmers,
+        &all_target_kmers,
         config.kmer_size,
         config.min_baseq,
     )?;
     info!(
-        "Father scan complete: found {} distinct ALT k-mers in reads",
+        "Father scan complete: found {} distinct target k-mers in reads",
         father_kmer_counts.len()
     );
 
@@ -264,6 +312,7 @@ pub fn run_filter(
                 child_ref_count: 0,
                 mother_alt_count: 0,
                 father_alt_count: 0,
+                proband_unique: 0,
                 low_complexity: false,
                 not_implemented: true,
             }
@@ -273,6 +322,7 @@ pub fn run_filter(
                 child_ref_count: 0,
                 mother_alt_count: 0,
                 father_alt_count: 0,
+                proband_unique: 0,
                 low_complexity: true,
                 not_implemented: false,
             }
@@ -337,9 +387,19 @@ pub fn run_filter(
                 .map(|km| father_kmer_counts.get(km).copied().unwrap_or(0))
                 .sum();
 
+            // Proband-unique k-mers: child read k-mers not found in either parent
+            let proband_unique: u32 = vi
+                .child_read_kmers
+                .iter()
+                .filter(|km| {
+                    !mother_kmer_counts.contains_key(*km)
+                        && !father_kmer_counts.contains_key(*km)
+                })
+                .count() as u32;
+
             if config.debug_kmers {
                 debug!(
-                    "Variant {}:{} - child_alt={}, child_ref={}, mother_alt={}, father_alt={}, alt_kmers={}, ref_kmers={}",
+                    "Variant {}:{} - child_alt={}, child_ref={}, mother_alt={}, father_alt={}, alt_kmers={}, ref_kmers={}, child_read_kmers={}, proband_unique={}",
                     vi.chrom,
                     vi.pos + 1,
                     child_alt_count,
@@ -348,6 +408,8 @@ pub fn run_filter(
                     father_alt_count,
                     vi.alt_kmer_set.len(),
                     vi.ref_kmer_set.len(),
+                    vi.child_read_kmers.len(),
+                    proband_unique,
                 );
             }
 
@@ -356,6 +418,7 @@ pub fn run_filter(
                 child_ref_count,
                 mother_alt_count,
                 father_alt_count,
+                proband_unique,
                 low_complexity: false,
                 not_implemented: false,
             }
@@ -370,6 +433,7 @@ pub fn run_filter(
             child_ref: score.child_ref_count as i32,
             mother_alt: score.mother_alt_count as i32,
             father_alt: score.father_alt_count as i32,
+            proband_unique: score.proband_unique as i32,
             status: filter,
         };
 
@@ -429,6 +493,7 @@ mod tests {
             child_ref_count: 15,
             mother_alt_count: 0,
             father_alt_count: 0,
+            proband_unique: 5,
             low_complexity: false,
             not_implemented: false,
         };
@@ -455,6 +520,7 @@ mod tests {
             child_ref_count: 20,
             mother_alt_count: 0,
             father_alt_count: 0,
+            proband_unique: 0,
             low_complexity: false,
             not_implemented: false,
         };
@@ -484,6 +550,7 @@ mod tests {
             child_ref_count: 15,
             mother_alt_count: 5,
             father_alt_count: 0,
+            proband_unique: 0,
             low_complexity: false,
             not_implemented: false,
         };
@@ -513,6 +580,7 @@ mod tests {
             child_ref_count: 0,
             mother_alt_count: 0,
             father_alt_count: 0,
+            proband_unique: 0,
             low_complexity: true,
             not_implemented: false,
         };
@@ -542,6 +610,7 @@ mod tests {
             child_ref_count: 0,
             mother_alt_count: 0,
             father_alt_count: 0,
+            proband_unique: 0,
             low_complexity: false,
             not_implemented: true,
         };
@@ -572,6 +641,7 @@ mod tests {
             child_ref_count: 100,
             mother_alt_count: 0,
             father_alt_count: 0,
+            proband_unique: 0,
             low_complexity: false,
             not_implemented: false,
         };

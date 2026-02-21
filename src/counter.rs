@@ -180,6 +180,72 @@ pub fn count_kmers_whole_file(
     Ok(counts)
 }
 
+/// Extract all distinct canonical k-mers from reads in a BAM region.
+/// Used for reference-free proband-unique k-mer analysis (RUFUS-like).
+///
+/// Returns the set of all distinct canonical k-mers found in reads overlapping the region.
+/// The same read-level filters as `count_kmers_in_reads` are applied (mapQ, flags, base quality).
+pub fn extract_all_kmers_in_region(
+    bam_path: &str,
+    ref_path: &str,
+    chrom: &str,
+    start: i64,
+    end: i64,
+    k: usize,
+    min_mapq: u8,
+    min_baseq: u8,
+    max_reads: usize,
+) -> Result<ahash::AHashSet<Vec<u8>>, Box<dyn std::error::Error>> {
+    let mut all_kmers = ahash::AHashSet::new();
+
+    let mut reader = bam::IndexedReader::from_path(bam_path)?;
+    reader.set_reference(ref_path)?;
+
+    let tid = reader
+        .header()
+        .tid(chrom.as_bytes())
+        .ok_or_else(|| format!("Contig '{}' not found in {}", chrom, bam_path))?;
+
+    reader.fetch(bam::FetchDefinition::Region(tid as i32, start, end))?;
+
+    let mut read_count = 0u64;
+    let mut record = bam::Record::new();
+
+    while let Some(result) = reader.read(&mut record) {
+        result?;
+
+        if record.mapq() < min_mapq {
+            continue;
+        }
+        let flags = record.flags();
+        if flags & 0x904 != 0 {
+            continue;
+        }
+        if flags & 0x400 != 0 {
+            continue;
+        }
+
+        read_count += 1;
+        if read_count as usize > max_reads {
+            debug!(
+                "Reached max reads ({}) for {}:{}-{}",
+                max_reads, chrom, start, end
+            );
+            break;
+        }
+
+        let seq = record.seq().as_bytes();
+        let qual = record.qual().to_vec();
+
+        let read_kmers = kmer::extract_kmers_with_qual(&seq, &qual, k, min_baseq);
+        for km in read_kmers {
+            all_kmers.insert(km);
+        }
+    }
+
+    Ok(all_kmers)
+}
+
 /// Count k-mers in reads from a specific region, returning total count for the target set.
 /// This is a simpler API that returns just the sum of counts for all target k-mers.
 pub fn count_target_kmers_in_region(
