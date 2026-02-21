@@ -163,6 +163,7 @@ fn test_denovo_proband_unique_reads() {
         min_mapq: 20,
         max_reads_per_locus: 200,
         debug_kmers: true,
+        threads: 1,
     };
 
     let summary = kmer_denovo::filter::run_filter(
@@ -173,6 +174,8 @@ fn test_denovo_proband_unique_reads() {
         &vcf_path,
         &output_path,
         &config,
+        None,
+        None,
     )
     .unwrap();
 
@@ -233,6 +236,7 @@ fn test_inherited_zero_proband_unique() {
         min_mapq: 20,
         max_reads_per_locus: 200,
         debug_kmers: false,
+        threads: 1,
     };
 
     let summary = kmer_denovo::filter::run_filter(
@@ -243,6 +247,8 @@ fn test_inherited_zero_proband_unique() {
         &vcf_path,
         &output_path,
         &config,
+        None,
+        None,
     )
     .unwrap();
 
@@ -301,6 +307,7 @@ fn test_mismapped_parent_detected() {
         min_mapq: 20,
         max_reads_per_locus: 200,
         debug_kmers: true,
+        threads: 1,
     };
 
     let summary = kmer_denovo::filter::run_filter(
@@ -311,6 +318,8 @@ fn test_mismapped_parent_detected() {
         &vcf_path,
         &output_path,
         &config,
+        None,
+        None,
     )
     .unwrap();
 
@@ -328,6 +337,95 @@ fn test_mismapped_parent_detected() {
         proband_unique, 0,
         "Expected KMER_PROBAND_UNIQUE == 0: whole-file scan should find ALT k-mers \
          in mother even though mapped to different position, got {}",
+        proband_unique
+    );
+}
+
+#[test]
+fn test_kmer_db_persistence() {
+    // Test that building and loading parent k-mer databases produces the same
+    // results as the direct BAM scan approach.
+    let dir = TempDir::new().unwrap();
+    let ref_path = create_reference(dir.path());
+
+    let child_reads = make_reads_with_alt(20, 10);
+    let child_reads_ref: Vec<(i64, &[u8])> =
+        child_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
+    let child_bam = create_bam(dir.path(), "child", &ref_path, &child_reads_ref);
+
+    let mother_reads = make_reads_with_alt(20, 0);
+    let mother_reads_ref: Vec<(i64, &[u8])> =
+        mother_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
+    let mother_bam = create_bam(dir.path(), "mother", &ref_path, &mother_reads_ref);
+
+    let father_reads = make_reads_with_alt(20, 0);
+    let father_reads_ref: Vec<(i64, &[u8])> =
+        father_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
+    let father_bam = create_bam(dir.path(), "father", &ref_path, &father_reads_ref);
+
+    let vcf_path = create_vcf(dir.path(), &ref_path);
+
+    let config = kmer_denovo::filter::FilterConfig {
+        kmer_size: 21,
+        min_baseq: 20,
+        min_mapq: 20,
+        max_reads_per_locus: 200,
+        debug_kmers: false,
+        threads: 1,
+    };
+
+    // First run: build databases (files don't exist yet → scan BAM and save)
+    let mother_db_path = dir.path().join("mother.kmdb").to_str().unwrap().to_string();
+    let father_db_path = dir.path().join("father.kmdb").to_str().unwrap().to_string();
+    let output1 = dir.path().join("output1.vcf").to_str().unwrap().to_string();
+
+    let summary1 = kmer_denovo::filter::run_filter(
+        &child_bam,
+        &mother_bam,
+        &father_bam,
+        &ref_path,
+        &vcf_path,
+        &output1,
+        &config,
+        Some(&mother_db_path),
+        Some(&father_db_path),
+    )
+    .unwrap();
+
+    // Verify databases were created
+    assert!(std::path::Path::new(&mother_db_path).exists());
+    assert!(std::path::Path::new(&father_db_path).exists());
+
+    // Second run: load databases from disk (files exist → skip BAM scan)
+    let output2 = dir.path().join("output2.vcf").to_str().unwrap().to_string();
+
+    let summary2 = kmer_denovo::filter::run_filter(
+        &child_bam,
+        &mother_bam,
+        &father_bam,
+        &ref_path,
+        &vcf_path,
+        &output2,
+        &config,
+        Some(&mother_db_path),
+        Some(&father_db_path),
+    )
+    .unwrap();
+
+    assert_eq!(summary1.total_variants, summary2.total_variants);
+
+    // Both runs should produce KMER_PROBAND_UNIQUE == 10
+    let mut reader = bcf::Reader::from_path(&output2).unwrap();
+    let mut record = reader.empty_record();
+    let _ = reader.read(&mut record).unwrap();
+    let proband_unique = record
+        .info(b"KMER_PROBAND_UNIQUE")
+        .integer()
+        .unwrap()
+        .unwrap()[0];
+    assert_eq!(
+        proband_unique, 10,
+        "Expected KMER_PROBAND_UNIQUE == 10 from loaded database, got {}",
         proband_unique
     );
 }

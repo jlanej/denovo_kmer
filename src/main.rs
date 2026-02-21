@@ -55,6 +55,22 @@ struct Cli {
     /// Enable per-variant debug output
     #[arg(long)]
     debug_kmers: bool,
+
+    /// Number of additional threads for BAM/CRAM decompression
+    #[arg(long, short = 't', default_value = "4")]
+    threads: usize,
+
+    /// Path to mother k-mer database file (.kmdb). If the file exists, it will be
+    /// loaded instead of scanning the BAM. If it does not exist, the BAM will be
+    /// scanned and the database saved to this path for future reuse.
+    #[arg(long)]
+    mother_kmer_db: Option<String>,
+
+    /// Path to father k-mer database file (.kmdb). If the file exists, it will be
+    /// loaded instead of scanning the BAM. If it does not exist, the BAM will be
+    /// scanned and the database saved to this path for future reuse.
+    #[arg(long)]
+    father_kmer_db: Option<String>,
 }
 
 fn main() {
@@ -79,10 +95,12 @@ fn main() {
         min_mapq: cli.min_mapq,
         max_reads_per_locus: cli.max_reads_per_locus,
         debug_kmers: cli.debug_kmers,
+        threads: cli.threads,
     };
 
     info!("kmer-denovo v{}", env!("CARGO_PKG_VERSION"));
     info!("K={}", cli.kmer_size);
+    info!("Threads={}", cli.threads);
     info!("Child: {}", cli.child);
     info!("Mother: {}", cli.mother);
     info!("Father: {}", cli.father);
@@ -97,6 +115,8 @@ fn main() {
         &cli.vcf,
         &cli.output,
         &config,
+        cli.mother_kmer_db.as_deref(),
+        cli.father_kmer_db.as_deref(),
     ) {
         Ok(summary) => {
             info!(
