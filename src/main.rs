@@ -15,11 +15,11 @@ struct Cli {
     #[arg(long)]
     child: String,
 
-    /// Mother BAM/CRAM file (indexed)
+    /// Mother BAM/CRAM file (index not required; scanned in full)
     #[arg(long)]
     mother: String,
 
-    /// Father BAM/CRAM file (indexed)
+    /// Father BAM/CRAM file (index not required; scanned in full)
     #[arg(long)]
     father: String,
 

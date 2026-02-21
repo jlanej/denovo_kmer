@@ -9,8 +9,8 @@ use rust_htslib::bcf;
 
 /// Create a unique temporary directory for this test run.
 fn test_dir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(format!(
-        "/tmp/denovo_kmer_test_{}_{name}",
+    let dir = std::env::temp_dir().join(format!(
+        "denovo_kmer_test_{}_{name}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&dir);
@@ -167,5 +167,98 @@ fn test_pipeline_detects_denovo_unique_kmers() {
     );
 
     // Cleanup
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Write a BAM file where reads can have custom flags (to test mismapped/unmapped
+/// parent reads are still scanned for k-mers).
+fn write_bam_with_flags(path: &str, reads: &[(&[u8], i64, u16)]) {
+    let header = bam_header();
+    let mut writer = bam::Writer::from_path(path, &header, bam::Format::Bam).unwrap();
+
+    for (i, (seq, pos, flags)) in reads.iter().enumerate() {
+        let mut rec = BamRecord::new();
+        let cigar = CigarString(vec![Cigar::Match(seq.len() as u32)]);
+        let qual = vec![30u8; seq.len()];
+        rec.set(format!("read{i}").as_bytes(), Some(&cigar), seq, &qual);
+        rec.set_flags(*flags);
+        rec.set_pos(*pos);
+        rec.set_tid(0);
+        rec.set_mapq(60);
+        writer.write(&rec).unwrap();
+    }
+}
+
+/// Verifies that parent reads with non-primary flags (secondary, supplementary,
+/// duplicate, unmapped) are still scanned for child k-mers, so that mismapped
+/// parent reads correctly eliminate inherited k-mers.
+#[test]
+fn test_mismapped_parent_reads_still_detected() {
+    let dir = test_dir("mismapped");
+    let child_bam = dir.join("child.bam");
+    let mother_bam = dir.join("mother.bam");
+    let father_bam = dir.join("father.bam");
+    let vcf_in = dir.join("input.vcf");
+    let vcf_out = dir.join("output.vcf");
+    let ref_fa = dir.join("ref.fa");
+
+    fs::write(&ref_fa, ">chr1\nACGTACGT\n").unwrap();
+
+    // Child has variant T at position 100; parent has same T but in a
+    // supplementary alignment (flag 0x800 = 2048).  The parent scan must
+    // still pick up the k-mer so the child read is NOT proband-unique.
+    let child_seq: &[u8] = b"ACGTATTCGTAACGT"; // T at offset 5 → pos 100
+    let parent_seq: &[u8] = b"ACGTATTCGTAACGT"; // identical to child
+
+    write_bam(child_bam.to_str().unwrap(), &[(child_seq, 95)]);
+    bam::index::build(
+        child_bam.to_str().unwrap(),
+        None::<&str>,
+        bam::index::Type::Bai,
+        1,
+    )
+    .unwrap();
+
+    // Mother: same sequence but marked as supplementary (flag 0x800)
+    write_bam_with_flags(
+        mother_bam.to_str().unwrap(),
+        &[(parent_seq, 95, 0x800)],
+    );
+
+    // Father: same sequence but marked as secondary (flag 0x100)
+    write_bam_with_flags(
+        father_bam.to_str().unwrap(),
+        &[(parent_seq, 95, 0x100)],
+    );
+
+    write_vcf(vcf_in.to_str().unwrap(), "chr1", 100, b"A", b"T");
+
+    let config = FilterConfig {
+        child_bam: child_bam.to_string_lossy().into_owned(),
+        mother_bam: mother_bam.to_string_lossy().into_owned(),
+        father_bam: father_bam.to_string_lossy().into_owned(),
+        ref_fasta: ref_fa.to_string_lossy().into_owned(),
+        vcf_path: vcf_in.to_string_lossy().into_owned(),
+        output_path: vcf_out.to_string_lossy().into_owned(),
+        metrics_path: None,
+        kmer_size: 5,
+        min_baseq: 20,
+        min_mapq: 20,
+        debug_kmers: false,
+        threads: 1,
+    };
+
+    run_filter(&config).unwrap();
+
+    // Parent reads contain the same k-mers (even though flagged as
+    // supplementary / secondary), so KMER_PROBAND_UNIQUE should be 0.
+    let counts = parse_proband_unique(vcf_out.to_str().unwrap());
+    assert_eq!(counts.len(), 1);
+    assert_eq!(
+        counts[0], 0,
+        "mismapped parent reads should still be detected; expected 0, got {}",
+        counts[0]
+    );
+
     let _ = fs::remove_dir_all(&dir);
 }

@@ -42,7 +42,7 @@ pub fn extract_kmers_with_qual_u128(
         return Vec::new();
     }
 
-    let mask: u128 = if k < 64 { (1u128 << (2 * k)) - 1 } else { u128::MAX };
+    let mask: u128 = if k >= 64 { u128::MAX } else { (1u128 << (2 * k)) - 1 };
     let mut result = Vec::new();
     let mut kmer: u128 = 0;
     let mut valid = 0usize;
@@ -77,7 +77,7 @@ pub fn extract_kmers_u128(seq: &[u8], k: usize) -> Vec<(usize, u128)> {
     if seq.len() < k {
         return Vec::new();
     }
-    let mask: u128 = if k < 64 { (1u128 << (2 * k)) - 1 } else { u128::MAX };
+    let mask: u128 = if k >= 64 { u128::MAX } else { (1u128 << (2 * k)) - 1 };
     let mut result = Vec::new();
     let mut kmer: u128 = 0;
     let mut valid = 0usize;

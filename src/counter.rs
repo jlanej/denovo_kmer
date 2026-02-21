@@ -97,7 +97,9 @@ pub fn collect_all_child_kmers(per_read_kmers: &[FxHashSet<u128>]) -> FxHashSet<
 }
 
 /// Scan an entire parent BAM/CRAM file, returning the set of child k-mers found
-/// in any parent read. No mapping quality filter is applied.
+/// in any parent read. No read filters are applied—every read is checked regardless
+/// of mapping status, flags, or quality—so that mismapped parent reads containing
+/// variant k-mers are still detected as inherited.
 pub fn scan_parent_bam(
     bam_path: &str,
     child_kmers: &FxHashSet<u128>,
@@ -117,16 +119,11 @@ pub fn scan_parent_bam(
     for result in bam.records() {
         let record = result?;
 
-        if record.is_unmapped()
-            || record.is_secondary()
-            || record.is_supplementary()
-            || record.is_duplicate()
-            || record.is_quality_check_failed()
-        {
+        let seq = record.seq().as_bytes();
+        if seq.is_empty() {
             continue;
         }
 
-        let seq = record.seq().as_bytes();
         let read_kmers = extract_kmers_u128(&seq, k);
 
         for (_, canonical) in &read_kmers {
