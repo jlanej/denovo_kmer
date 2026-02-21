@@ -348,8 +348,8 @@ fn test_mismapped_parent_detected() {
     let child_bam = create_bam(dir.path(), "child", &ref_path, &child_reads_ref);
 
     // Mother: reads containing the same ALT sequence but mapped to pos 300.
-    // We take the same read sequence that spans the variant (with ALT allele)
-    // but record them as aligned to position 300.
+    // Generated separately from child reads, then remapped to a distant position
+    // to simulate a mismapping scenario.
     let mother_alt_reads = make_reads_with_alt(20, 10);
     let mother_mismapped: Vec<(i64, Vec<u8>)> = mother_alt_reads
         .into_iter()

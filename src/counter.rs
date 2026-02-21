@@ -143,8 +143,9 @@ pub fn count_kmers_whole_file(
 
         let flags = record.flags();
         // Skip secondary (0x100), QC-fail (0x200), duplicate (0x400), supplementary (0x800).
-        // Do NOT filter by mapping quality — this is an aligner-agnostic search.
-        // Do NOT skip unmapped reads (0x4) — they may still carry target k-mers.
+        // Unmapped reads (0x4) are intentionally NOT skipped — their sequence may
+        // still contain target k-mers, and this scan is aligner-agnostic.
+        // Mapping quality is also not checked for the same reason.
         if flags & 0xF00 != 0 {
             continue;
         }
