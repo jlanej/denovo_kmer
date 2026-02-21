@@ -1,0 +1,19 @@
+[package]
+name = "kmer-denovo"
+version = "0.1.0"
+edition = "2021"
+description = "De novo variant filtering using k-mer evidence from trio WGS data"
+license = "MIT"
+
+[dependencies]
+rust-htslib = "1.0"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+rayon = "1.10"
+ahash = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
