@@ -1,4 +1,10 @@
 /// Scoring, filtering, and main pipeline logic.
+///
+/// The pipeline uses a two-phase approach for parent vs child counting:
+/// - **Child**: Region-based counting around the variant locus (trusts alignment).
+/// - **Parents**: Whole-file aligner-agnostic scanning of ALL reads, with all
+///   ALT k-mers batched together for a single pass per parent file. This catches
+///   inherited variants even when parent reads are mismapped to different loci.
 use ahash::AHashSet;
 use log::{debug, info, warn};
 use rayon::prelude::*;
@@ -25,6 +31,26 @@ pub struct FilterConfig {
     pub debug_kmers: bool,
 }
 
+/// Precomputed k-mer information for a single variant.
+struct VariantKmerInfo {
+    /// VCF record index for output tracking
+    record_idx: usize,
+    /// Chromosome
+    chrom: String,
+    /// 0-based position
+    pos: i64,
+    /// Length of reference allele
+    ref_allele_len: usize,
+    /// Canonical ALT-unique k-mers for this variant
+    alt_kmer_set: AHashSet<Vec<u8>>,
+    /// Canonical REF-unique k-mers for this variant
+    ref_kmer_set: AHashSet<Vec<u8>>,
+    /// Whether all ALT k-mers are low complexity
+    low_complexity: bool,
+    /// Whether variant type/size is unsupported
+    not_implemented: bool,
+}
+
 /// Result of scoring a single variant.
 #[derive(Debug)]
 struct ScoreResult {
@@ -36,148 +62,57 @@ struct ScoreResult {
     not_implemented: bool,
 }
 
-/// Score a single variant against all three trio members.
-fn score_variant(
-    var: &Variant,
-    ref_seq: &[u8],
-    child_bam: &str,
-    mother_bam: &str,
-    father_bam: &str,
+/// Build haplotype k-mers for all variants, loading reference per contig.
+fn build_all_variant_kmers(
+    variants: &[Variant],
     ref_path: &str,
     config: &FilterConfig,
-) -> Result<ScoreResult, Box<dyn std::error::Error + Send + Sync>> {
-    // Check variant size
-    if var.size() > config.max_variant_size {
-        return Ok(ScoreResult {
-            child_alt_count: 0,
-            child_ref_count: 0,
-            mother_alt_count: 0,
-            father_alt_count: 0,
-            low_complexity: false,
-            not_implemented: true,
-        });
+) -> Result<Vec<VariantKmerInfo>, Box<dyn std::error::Error>> {
+    let mut by_contig: ahash::AHashMap<String, Vec<&Variant>> = ahash::AHashMap::new();
+    for var in variants {
+        by_contig.entry(var.chrom.clone()).or_default().push(var);
     }
 
-    // Build haplotype k-mers
-    let hap_kmers = haplotype::build_haplotype_kmers(ref_seq, var, config.kmer_size);
+    let mut infos: Vec<VariantKmerInfo> = Vec::with_capacity(variants.len());
 
-    if hap_kmers.low_complexity {
-        return Ok(ScoreResult {
-            child_alt_count: 0,
-            child_ref_count: 0,
-            mother_alt_count: 0,
-            father_alt_count: 0,
-            low_complexity: true,
-            not_implemented: false,
-        });
+    for (contig, contig_vars) in &by_contig {
+        let ref_seq = load_reference_contig(ref_path, contig)
+            .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+
+        for var in contig_vars {
+            if var.size() > config.max_variant_size {
+                infos.push(VariantKmerInfo {
+                    record_idx: var.record_idx,
+                    chrom: var.chrom.clone(),
+                    pos: var.pos,
+                    ref_allele_len: var.ref_allele.len(),
+                    alt_kmer_set: AHashSet::new(),
+                    ref_kmer_set: AHashSet::new(),
+                    low_complexity: false,
+                    not_implemented: true,
+                });
+                continue;
+            }
+
+            let hap_kmers = haplotype::build_haplotype_kmers(&ref_seq, var, config.kmer_size);
+            let alt_set: AHashSet<Vec<u8>> = hap_kmers.alt_kmers.into_iter().collect();
+            let ref_set: AHashSet<Vec<u8>> = hap_kmers.ref_kmers.into_iter().collect();
+            let low_complexity = hap_kmers.low_complexity || alt_set.is_empty();
+
+            infos.push(VariantKmerInfo {
+                record_idx: var.record_idx,
+                chrom: var.chrom.clone(),
+                pos: var.pos,
+                ref_allele_len: var.ref_allele.len(),
+                alt_kmer_set: alt_set,
+                ref_kmer_set: ref_set,
+                low_complexity,
+                not_implemented: false,
+            });
+        }
     }
 
-    if hap_kmers.alt_kmers.is_empty() {
-        debug!(
-            "No ALT-unique k-mers for {}:{}",
-            var.chrom,
-            var.pos + 1
-        );
-        return Ok(ScoreResult {
-            child_alt_count: 0,
-            child_ref_count: 0,
-            mother_alt_count: 0,
-            father_alt_count: 0,
-            low_complexity: true,
-            not_implemented: false,
-        });
-    }
-
-    let alt_kmer_set: AHashSet<Vec<u8>> = hap_kmers.alt_kmers.into_iter().collect();
-    let ref_kmer_set: AHashSet<Vec<u8>> = hap_kmers.ref_kmers.into_iter().collect();
-
-    // Define search region
-    let start = (var.pos - config.window as i64).max(0);
-    let end = var.pos + var.ref_allele.len() as i64 + config.window as i64;
-
-    // Count child ALT k-mers
-    let child_alt_count = counter::count_target_kmers_in_region(
-        child_bam,
-        ref_path,
-        &var.chrom,
-        start,
-        end,
-        &alt_kmer_set,
-        config.kmer_size,
-        config.min_mapq,
-        config.min_baseq,
-        config.max_reads_per_locus,
-    )
-    .map_err(|e| format!("Child ALT counting error: {}", e))?;
-
-    // Count child REF k-mers
-    let child_ref_count = counter::count_target_kmers_in_region(
-        child_bam,
-        ref_path,
-        &var.chrom,
-        start,
-        end,
-        &ref_kmer_set,
-        config.kmer_size,
-        config.min_mapq,
-        config.min_baseq,
-        config.max_reads_per_locus,
-    )
-    .map_err(|e| format!("Child REF counting error: {}", e))?;
-
-    // Count parent ALT k-mers - search the region around the variant
-    // For a more thorough aligner-free approach, we search the parents' reads
-    // in the same region. The window parameter controls how wide we look.
-    let mother_alt_count = counter::count_target_kmers_in_region(
-        mother_bam,
-        ref_path,
-        &var.chrom,
-        start,
-        end,
-        &alt_kmer_set,
-        config.kmer_size,
-        config.min_mapq,
-        config.min_baseq,
-        config.max_reads_per_locus,
-    )
-    .map_err(|e| format!("Mother ALT counting error: {}", e))?;
-
-    let father_alt_count = counter::count_target_kmers_in_region(
-        father_bam,
-        ref_path,
-        &var.chrom,
-        start,
-        end,
-        &alt_kmer_set,
-        config.kmer_size,
-        config.min_mapq,
-        config.min_baseq,
-        config.max_reads_per_locus,
-    )
-    .map_err(|e| format!("Father ALT counting error: {}", e))?;
-
-    if config.debug_kmers {
-        debug!(
-            "Variant {}:{} - child_alt={}, child_ref={}, mother_alt={}, father_alt={}, alt_kmers={}, ref_kmers={}",
-            var.chrom,
-            var.pos + 1,
-            child_alt_count,
-            child_ref_count,
-            mother_alt_count,
-            father_alt_count,
-            alt_kmer_set.len(),
-            ref_kmer_set.len(),
-        );
-    }
-
-    Ok(ScoreResult {
-        child_alt_count,
-        child_ref_count,
-        mother_alt_count,
-        father_alt_count,
-        low_complexity: false,
-        not_implemented: false,
-    })
+    Ok(infos)
 }
 
 /// Determine FILTER status from scores.
@@ -227,6 +162,14 @@ fn load_reference_contig(
 }
 
 /// Main pipeline entry point.
+///
+/// Pipeline phases:
+/// 1. Load variants and build haplotype k-mers for all variants.
+/// 2. Collect all ALT k-mers into a unified set and scan each parent's
+///    entire BAM/CRAM in ONE pass (aligner-agnostic, no mapQ filter).
+/// 3. For each variant, count child k-mers via region-based queries and
+///    look up parent counts from the whole-file scan results.
+/// 4. Score, annotate, and write output VCF.
 pub fn run_filter(
     child_bam: &str,
     mother_bam: &str,
@@ -250,13 +193,12 @@ pub fn run_filter(
             });
     }
 
-    // Read variants
+    // Phase 1: Load variants and build haplotype k-mers
     info!("Reading variants from {}", vcf_path);
     let variants = vcf_io::read_variants(vcf_path)?;
     info!("Loaded {} candidate variants", variants.len());
 
     if variants.is_empty() {
-        // Write empty annotated VCF
         vcf_io::write_annotated_vcf(vcf_path, output_path, &[])?;
         return Ok(FilterSummary {
             total_variants: 0,
@@ -266,85 +208,173 @@ pub fn run_filter(
         });
     }
 
-    // Group variants by contig for efficient reference loading
-    let mut by_contig: ahash::AHashMap<String, Vec<&Variant>> = ahash::AHashMap::new();
-    for var in &variants {
-        by_contig
-            .entry(var.chrom.clone())
-            .or_default()
-            .push(var);
-    }
+    info!("Building haplotype k-mers for {} variants...", variants.len());
+    let var_infos = build_all_variant_kmers(&variants, ref_path, config)?;
 
-    // Process variants
+    // Phase 2: Whole-file parent scanning (aligner-agnostic)
+    // Collect ALL ALT k-mers from all variants into one set for efficient batched scanning.
+    let all_alt_kmers: AHashSet<Vec<u8>> = var_infos
+        .iter()
+        .filter(|vi| !vi.low_complexity && !vi.not_implemented)
+        .flat_map(|vi| vi.alt_kmer_set.iter().cloned())
+        .collect();
+    info!(
+        "Collected {} unique ALT k-mers for parent scanning",
+        all_alt_kmers.len()
+    );
+
+    // Scan each parent's entire BAM/CRAM in ONE pass. No mapQ filter is applied
+    // so that reads mismapped to other loci are still checked for ALT k-mers.
+    info!("Scanning mother BAM/CRAM (whole-file, aligner-agnostic)...");
+    let mother_kmer_counts = counter::count_kmers_whole_file(
+        mother_bam,
+        ref_path,
+        &all_alt_kmers,
+        config.kmer_size,
+        config.min_baseq,
+    )?;
+    info!(
+        "Mother scan complete: found {} distinct ALT k-mers in reads",
+        mother_kmer_counts.len()
+    );
+
+    info!("Scanning father BAM/CRAM (whole-file, aligner-agnostic)...");
+    let father_kmer_counts = counter::count_kmers_whole_file(
+        father_bam,
+        ref_path,
+        &all_alt_kmers,
+        config.kmer_size,
+        config.min_baseq,
+    )?;
+    info!(
+        "Father scan complete: found {} distinct ALT k-mers in reads",
+        father_kmer_counts.len()
+    );
+
+    // Phase 3: Per-variant child counting (region-based) and scoring.
+    // Child reads are queried by region since we trust the child alignment
+    // for the candidate variant loci.
+    info!("Counting child k-mers (region-based) and scoring variants...");
     let annotations: Mutex<Vec<VariantAnnotation>> = Mutex::new(Vec::new());
-    let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-    let contigs: Vec<(String, Vec<&Variant>)> = by_contig.into_iter().collect();
+    var_infos.par_iter().for_each(|vi| {
+        let score = if vi.not_implemented {
+            ScoreResult {
+                child_alt_count: 0,
+                child_ref_count: 0,
+                mother_alt_count: 0,
+                father_alt_count: 0,
+                low_complexity: false,
+                not_implemented: true,
+            }
+        } else if vi.low_complexity {
+            ScoreResult {
+                child_alt_count: 0,
+                child_ref_count: 0,
+                mother_alt_count: 0,
+                father_alt_count: 0,
+                low_complexity: true,
+                not_implemented: false,
+            }
+        } else {
+            // Child: region-based counting around the variant locus
+            let start = (vi.pos - config.window as i64).max(0);
+            let end = vi.pos + vi.ref_allele_len as i64 + config.window as i64;
 
-    contigs.into_par_iter().for_each(|(contig, contig_vars)| {
-        info!(
-            "Processing {} variants on {}",
-            contig_vars.len(),
-            contig
-        );
+            let child_alt_count = counter::count_target_kmers_in_region(
+                child_bam,
+                ref_path,
+                &vi.chrom,
+                start,
+                end,
+                &vi.alt_kmer_set,
+                config.kmer_size,
+                config.min_mapq,
+                config.min_baseq,
+                config.max_reads_per_locus,
+            )
+            .unwrap_or_else(|e| {
+                warn!(
+                    "Child ALT counting error for {}:{}: {}",
+                    vi.chrom,
+                    vi.pos + 1,
+                    e
+                );
+                0
+            });
 
-        // Load reference for this contig
-        let ref_seq = match load_reference_contig(ref_path, &contig) {
-            Ok(seq) => seq,
-            Err(e) => {
-                errors
-                    .lock()
-                    .unwrap()
-                    .push(format!("Failed to load contig {}: {}", contig, e));
-                return;
+            let child_ref_count = counter::count_target_kmers_in_region(
+                child_bam,
+                ref_path,
+                &vi.chrom,
+                start,
+                end,
+                &vi.ref_kmer_set,
+                config.kmer_size,
+                config.min_mapq,
+                config.min_baseq,
+                config.max_reads_per_locus,
+            )
+            .unwrap_or_else(|e| {
+                warn!(
+                    "Child REF counting error for {}:{}: {}",
+                    vi.chrom,
+                    vi.pos + 1,
+                    e
+                );
+                0
+            });
+
+            // Parents: look up counts from the whole-file scan results
+            let mother_alt_count: u32 = vi
+                .alt_kmer_set
+                .iter()
+                .map(|km| mother_kmer_counts.get(km).copied().unwrap_or(0))
+                .sum();
+            let father_alt_count: u32 = vi
+                .alt_kmer_set
+                .iter()
+                .map(|km| father_kmer_counts.get(km).copied().unwrap_or(0))
+                .sum();
+
+            if config.debug_kmers {
+                debug!(
+                    "Variant {}:{} - child_alt={}, child_ref={}, mother_alt={}, father_alt={}, alt_kmers={}, ref_kmers={}",
+                    vi.chrom,
+                    vi.pos + 1,
+                    child_alt_count,
+                    child_ref_count,
+                    mother_alt_count,
+                    father_alt_count,
+                    vi.alt_kmer_set.len(),
+                    vi.ref_kmer_set.len(),
+                );
+            }
+
+            ScoreResult {
+                child_alt_count,
+                child_ref_count,
+                mother_alt_count,
+                father_alt_count,
+                low_complexity: false,
+                not_implemented: false,
             }
         };
 
-        for var in &contig_vars {
-            let score = match score_variant(
-                var, &ref_seq, child_bam, mother_bam, father_bam, ref_path, config,
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        "Error scoring variant {}:{}: {}",
-                        var.chrom,
-                        var.pos + 1,
-                        e
-                    );
-                    // Default to not implemented on error
-                    ScoreResult {
-                        child_alt_count: 0,
-                        child_ref_count: 0,
-                        mother_alt_count: 0,
-                        father_alt_count: 0,
-                        low_complexity: false,
-                        not_implemented: true,
-                    }
-                }
-            };
+        let filter = determine_filter(&score, config);
+        let ann = VariantAnnotation {
+            record_idx: vi.record_idx,
+            filter: filter.clone(),
+            kmer_k: config.kmer_size as i32,
+            child_alt: score.child_alt_count as i32,
+            child_ref: score.child_ref_count as i32,
+            mother_alt: score.mother_alt_count as i32,
+            father_alt: score.father_alt_count as i32,
+            status: filter,
+        };
 
-            let filter = determine_filter(&score, config);
-            let ann = VariantAnnotation {
-                record_idx: var.record_idx,
-                filter: filter.clone(),
-                kmer_k: config.kmer_size as i32,
-                child_alt: score.child_alt_count as i32,
-                child_ref: score.child_ref_count as i32,
-                mother_alt: score.mother_alt_count as i32,
-                father_alt: score.father_alt_count as i32,
-                status: filter,
-            };
-
-            annotations.lock().unwrap().push(ann);
-        }
+        annotations.lock().unwrap().push(ann);
     });
-
-    let errs = errors.into_inner().unwrap();
-    if !errs.is_empty() {
-        let msg = errs.join("; ");
-        return Err(format!("{} contig(s) failed to process: {}", errs.len(), msg).into());
-    }
 
     let mut anns = annotations.into_inner().unwrap();
     // Sort by record index to maintain VCF order
@@ -368,7 +398,7 @@ pub fn run_filter(
     }
     summary.runtime_seconds = start_time.elapsed().as_secs_f64();
 
-    // Write output VCF
+    // Phase 4: Write output VCF
     info!("Writing annotated VCF to {}", output_path);
     vcf_io::write_annotated_vcf(vcf_path, output_path, &anns)?;
 

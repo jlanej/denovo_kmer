@@ -11,6 +11,11 @@ member. Variants are annotated with k-mer evidence counts and assigned FILTER
 tags indicating whether they are likely true de novos, inherited, or
 uninformative.
 
+**Key design**: Parent samples are scanned in an **aligner-agnostic** manner
+across their entire BAM/CRAM (one pass per parent), so inherited variants are
+detected even when parent reads are mismapped to a different locus. The child
+is queried region-by-region since we trust its alignment at the candidate loci.
+
 ## Installation
 
 ### Requirements

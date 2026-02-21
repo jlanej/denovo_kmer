@@ -331,3 +331,73 @@ fn test_no_child_alt_support() {
         "Expected DN_KMER_NO_CHILD_ALT for insufficient child support"
     );
 }
+
+#[test]
+fn test_mismapped_parent_detected() {
+    // Scenario: Child has ALT reads at pos 100. Mother has reads carrying the
+    // same ALT k-mers, but they are *mapped to a different position* (pos 300).
+    // A region-based parent search would miss these, but the whole-file
+    // aligner-agnostic scan must detect them -> DN_KMER_PARENT_ALT.
+    let dir = TempDir::new().unwrap();
+    let ref_path = create_reference(dir.path());
+
+    // Child: 10 reads with ALT at pos 100
+    let child_reads = make_reads_with_alt(20, 10);
+    let child_reads_ref: Vec<(i64, &[u8])> =
+        child_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
+    let child_bam = create_bam(dir.path(), "child", &ref_path, &child_reads_ref);
+
+    // Mother: reads containing the same ALT sequence but mapped to pos 300.
+    // We take the same read sequence that spans the variant (with ALT allele)
+    // but record them as aligned to position 300.
+    let mother_alt_reads = make_reads_with_alt(20, 10);
+    let mother_mismapped: Vec<(i64, Vec<u8>)> = mother_alt_reads
+        .into_iter()
+        .map(|(_pos, seq)| (300i64, seq)) // map to a distant position
+        .collect();
+    let mother_reads_ref: Vec<(i64, &[u8])> =
+        mother_mismapped.iter().map(|(p, s)| (*p, s.as_slice())).collect();
+    let mother_bam = create_bam(dir.path(), "mother", &ref_path, &mother_reads_ref);
+
+    // Father: all REF at the correct position
+    let father_reads = make_reads_with_alt(20, 0);
+    let father_reads_ref: Vec<(i64, &[u8])> =
+        father_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
+    let father_bam = create_bam(dir.path(), "father", &ref_path, &father_reads_ref);
+
+    let vcf_path = create_vcf(dir.path(), &ref_path);
+    let output_path = dir.path().join("output.vcf").to_str().unwrap().to_string();
+
+    let config = kmer_denovo::filter::FilterConfig {
+        kmer_size: 21,
+        min_baseq: 20,
+        min_mapq: 20,
+        max_reads_per_locus: 200,
+        min_child_alt: 3,
+        max_parent_alt: 1,
+        min_child_alt_ratio: 0.1,
+        max_variant_size: 50,
+        window: 500,
+        debug_kmers: true,
+    };
+
+    let summary = kmer_denovo::filter::run_filter(
+        &child_bam,
+        &mother_bam,
+        &father_bam,
+        &ref_path,
+        &vcf_path,
+        &output_path,
+        &config,
+        1,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(summary.total_variants, 1);
+    assert_eq!(
+        summary.dn_kmer_parent_alt, 1,
+        "Expected DN_KMER_PARENT_ALT: whole-file scan should find ALT k-mers \
+         in mother even though her reads are mapped to a different position"
+    );
+}

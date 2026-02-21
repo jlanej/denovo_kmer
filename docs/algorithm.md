@@ -29,15 +29,51 @@ For each candidate variant in the input VCF:
 
 ## Read Counting
 
-For each trio member (child, mother, father):
+The pipeline uses a **two-phase counting strategy** that differs between the
+child and parent samples:
 
-1. **Fetch reads** overlapping a window around the variant locus.
+### Child: Region-based counting
+
+For the **child**, reads are fetched from a window around the variant locus
+using indexed BAM/CRAM access (the `--window` parameter controls the window
+size). This is efficient and appropriate because the candidate variants come
+from the child's alignment, so we trust the child's read mapping.
+
+1. **Fetch reads** overlapping the variant window from the indexed BAM/CRAM.
 2. **Quality filter**: Skip reads with mapping quality below `--min-mapq`.
    Mask individual bases below `--min-baseq` as N (which breaks k-mers
    spanning those positions).
 3. **Extract k-mers** from each read's sequence.
 4. **Count matches** against the ALT-unique and REF-unique k-mer sets.
    Each target k-mer is counted at most once per read.
+
+### Parents: Whole-file aligner-agnostic scanning
+
+For **parent** samples, the tool scans the **entire BAM/CRAM** in a single
+pass per parent, regardless of read mapping position. This is critical because:
+
+- A child may appear to have de novo variants in a region due to mismapping.
+- Parent reads carrying the same variant may be mapped to a completely
+  different genomic location.
+- A region-based search of parents would miss these mismapped reads, leading
+  to false de novo calls.
+
+The whole-file scan is **aligner-agnostic**: it does not filter by mapping
+quality and processes all primary, non-duplicate reads. This ensures inherited
+variants are detected regardless of alignment.
+
+For **performance**, all ALT k-mers from all candidate variants are collected
+into a single hash set before scanning. Each parent file is read exactly once,
+and every read's k-mers are checked against this unified set. The per-variant
+counts are then resolved by looking up each variant's specific ALT k-mers in
+the scan results.
+
+Reads skipped during parent scanning:
+- Secondary alignments (to avoid double-counting)
+- Supplementary alignments (split-read duplicates)
+- PCR/optical duplicates
+- QC-failed reads
+- Reads with no sequence data
 
 ## Filtering Decision
 
@@ -89,8 +125,9 @@ The output VCF includes the following INFO fields:
   either parent. Set to 0 for strict filtering.
 - **`--min-child-alt-ratio` (default: 0.1)**: Prevents calling de novos with
   very low variant allele fraction.
-- **`--window` (default: 500)**: Read fetch window around each variant.
-  Increase for structural variants or repetitive regions.
+- **`--window` (default: 500)**: Read fetch window around each variant for
+  child counting. Only affects the child region-based queries; parent
+  scanning always covers the entire file.
 
 ## Limitations
 
@@ -102,3 +139,9 @@ The output VCF includes the following INFO fields:
   to meet the `--min-child-alt` threshold.
 - **Multiallelic sites**: Each ALT allele is processed independently.
 - **Symbolic alleles**: Breakend and symbolic alleles (e.g., `<DEL>`) are skipped.
+- **Parent scan time**: Whole-file scanning of parent BAM/CRAMs is I/O
+  intensive. For a 30x WGS CRAM (~30-50 GB), expect ~5-10 minutes per
+  parent. This is a one-time cost regardless of variant count.
+- **K-mer representation**: K-mers are stored as byte vectors. For very
+  large variant sets (>100K), consider Jellyfish databases for further
+  performance optimization.

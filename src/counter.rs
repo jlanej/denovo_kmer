@@ -101,18 +101,28 @@ pub fn count_kmers_in_reads(
 }
 
 /// Scan the entire BAM/CRAM for target k-mers (aligner-free whole-file search).
-/// This is used for parent samples to do a thorough search for alt k-mers across the whole file.
+/// This is used for parent samples to do a thorough, aligner-agnostic search
+/// for ALT k-mers across ALL reads in the file, regardless of mapping position.
+///
+/// This catches inherited variants even when parent reads carrying the variant
+/// allele are mapped to a different genomic location than the child's reads
+/// (e.g., due to mismapping or structural variation).
+///
+/// Key differences from region-based counting:
+/// - Uses sequential reader (no BAM index required)
+/// - No mapping quality filter (aligner-agnostic)
+/// - Scans ALL primary, non-duplicate reads in the file
+/// - Only filters by base quality and read flags
+///
+/// For performance, ALL ALT k-mers from ALL candidate variants should be batched
+/// into a single target set, so only ONE pass per parent file is needed.
 ///
 /// Returns a map from canonical k-mer -> total read count.
-///
-/// This function iterates through ALL reads in the file, which is expensive but
-/// provides maximum sensitivity for detecting inherited variants.
 pub fn count_kmers_whole_file(
     bam_path: &str,
     ref_path: &str,
     target_kmers: &ahash::AHashSet<Vec<u8>>,
     k: usize,
-    min_mapq: u8,
     min_baseq: u8,
 ) -> Result<AHashMap<Vec<u8>, u32>, Box<dyn std::error::Error>> {
     let mut counts: AHashMap<Vec<u8>, u32> = AHashMap::new();
@@ -121,22 +131,30 @@ pub fn count_kmers_whole_file(
         return Ok(counts);
     }
 
-    let mut reader = bam::IndexedReader::from_path(bam_path)?;
+    // Use sequential reader — no index required for whole-file scan
+    let mut reader = bam::Reader::from_path(bam_path)?;
     reader.set_reference(ref_path)?;
 
     let mut record = bam::Record::new();
+    let mut total_reads = 0u64;
 
     while let Some(result) = reader.read(&mut record) {
         result?;
 
-        if record.mapq() < min_mapq {
-            continue;
-        }
         let flags = record.flags();
-        if flags & 0xD04 != 0 {
-            // unmapped(0x4) | secondary(0x100) | duplicate(0x400) | supplementary(0x800)
+        // Skip secondary (0x100), QC-fail (0x200), duplicate (0x400), supplementary (0x800).
+        // Do NOT filter by mapping quality — this is an aligner-agnostic search.
+        // Do NOT skip unmapped reads (0x4) — they may still carry target k-mers.
+        if flags & 0xF00 != 0 {
             continue;
         }
+
+        // Skip reads with no sequence (can happen with unmapped reads in CRAM)
+        if record.seq_len() == 0 {
+            continue;
+        }
+
+        total_reads += 1;
 
         let seq = record.seq().as_bytes();
         let qual = record.qual().to_vec();
@@ -150,6 +168,13 @@ pub fn count_kmers_whole_file(
             }
         }
     }
+
+    debug!(
+        "Whole-file scan of {}: processed {} primary reads, found {} distinct target k-mers",
+        bam_path,
+        total_reads,
+        counts.len()
+    );
 
     Ok(counts)
 }
