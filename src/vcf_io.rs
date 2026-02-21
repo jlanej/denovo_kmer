@@ -213,7 +213,8 @@ pub fn write_annotated_vcf(
             let filter_id = writer.header().name_to_id(ann.filter.as_bytes())?;
             new_record.set_filters(&[&filter_id])?;
         } else {
-            // Copy existing filters if any
+            // No annotation for this record (should not happen in normal operation).
+            // Retain PASS as default since we cannot copy filters across headers easily.
             let pass_id = writer.header().name_to_id(b"PASS")?;
             new_record.set_filters(&[&pass_id])?;
         }

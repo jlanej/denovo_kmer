@@ -133,7 +133,8 @@ pub fn count_kmers_whole_file(
             continue;
         }
         let flags = record.flags();
-        if flags & 0xF04 != 0 {
+        if flags & 0xD04 != 0 {
+            // unmapped(0x4) | secondary(0x100) | duplicate(0x400) | supplementary(0x800)
             continue;
         }
 

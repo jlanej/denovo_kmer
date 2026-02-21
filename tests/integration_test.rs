@@ -116,7 +116,7 @@ fn create_vcf(dir: &std::path::Path, ref_path: &str) -> String {
 }
 
 /// Create reads spanning position 100, with some carrying an ALT base.
-fn make_reads_with_alt(_start: i64, count: usize, alt_count: usize) -> Vec<(i64, Vec<u8>)> {
+fn make_reads_with_alt(count: usize, alt_count: usize) -> Vec<(i64, Vec<u8>)> {
     let ref_seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\
                GATTACAGATTACAGATTACAGATTACAGATTACAGATTACAGATTACAGATT\
                CGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGAT\
@@ -157,19 +157,19 @@ fn test_denovo_snv_detected() {
     let ref_path = create_reference(dir.path());
 
     // Child: 10 reads with ALT, 10 with REF
-    let child_reads = make_reads_with_alt(50, 20, 10);
+    let child_reads = make_reads_with_alt(20, 10);
     let child_reads_ref: Vec<(i64, &[u8])> =
         child_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
     let child_bam = create_bam(dir.path(), "child", &ref_path, &child_reads_ref);
 
     // Mother: 20 reads all REF
-    let mother_reads = make_reads_with_alt(50, 20, 0);
+    let mother_reads = make_reads_with_alt(20, 0);
     let mother_reads_ref: Vec<(i64, &[u8])> =
         mother_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
     let mother_bam = create_bam(dir.path(), "mother", &ref_path, &mother_reads_ref);
 
     // Father: 20 reads all REF
-    let father_reads = make_reads_with_alt(50, 20, 0);
+    let father_reads = make_reads_with_alt(20, 0);
     let father_reads_ref: Vec<(i64, &[u8])> =
         father_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
     let father_bam = create_bam(dir.path(), "father", &ref_path, &father_reads_ref);
@@ -220,19 +220,19 @@ fn test_inherited_variant_detected() {
     let ref_path = create_reference(dir.path());
 
     // Child: 10 reads with ALT
-    let child_reads = make_reads_with_alt(50, 20, 10);
+    let child_reads = make_reads_with_alt(20, 10);
     let child_reads_ref: Vec<(i64, &[u8])> =
         child_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
     let child_bam = create_bam(dir.path(), "child", &ref_path, &child_reads_ref);
 
     // Mother: 10 reads with ALT (inherited!)
-    let mother_reads = make_reads_with_alt(50, 20, 10);
+    let mother_reads = make_reads_with_alt(20, 10);
     let mother_reads_ref: Vec<(i64, &[u8])> =
         mother_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
     let mother_bam = create_bam(dir.path(), "mother", &ref_path, &mother_reads_ref);
 
     // Father: all REF
-    let father_reads = make_reads_with_alt(50, 20, 0);
+    let father_reads = make_reads_with_alt(20, 0);
     let father_reads_ref: Vec<(i64, &[u8])> =
         father_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
     let father_bam = create_bam(dir.path(), "father", &ref_path, &father_reads_ref);
@@ -280,18 +280,18 @@ fn test_no_child_alt_support() {
     let ref_path = create_reference(dir.path());
 
     // Child: only 1 read with ALT (below threshold of 3)
-    let child_reads = make_reads_with_alt(50, 20, 1);
+    let child_reads = make_reads_with_alt(20, 1);
     let child_reads_ref: Vec<(i64, &[u8])> =
         child_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
     let child_bam = create_bam(dir.path(), "child", &ref_path, &child_reads_ref);
 
     // Parents: all REF
-    let mother_reads = make_reads_with_alt(50, 20, 0);
+    let mother_reads = make_reads_with_alt(20, 0);
     let mother_reads_ref: Vec<(i64, &[u8])> =
         mother_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
     let mother_bam = create_bam(dir.path(), "mother", &ref_path, &mother_reads_ref);
 
-    let father_reads = make_reads_with_alt(50, 20, 0);
+    let father_reads = make_reads_with_alt(20, 0);
     let father_reads_ref: Vec<(i64, &[u8])> =
         father_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
     let father_bam = create_bam(dir.path(), "father", &ref_path, &father_reads_ref);

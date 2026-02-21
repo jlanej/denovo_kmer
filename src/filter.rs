@@ -218,10 +218,10 @@ fn load_reference_contig(
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let reader = rust_htslib::faidx::Reader::from_path(ref_path)
         .map_err(|e| format!("Cannot open reference {}: {}", ref_path, e))?;
-    // Fetch the whole contig. Using a very large end position is fine;
-    // htslib will clamp to the actual contig length.
+    // Fetch the whole contig by requesting up to a large end position.
+    // htslib clamps the request to the actual contig length.
     let seq = reader
-        .fetch_seq_string(contig, 0, i64::MAX as usize / 2)
+        .fetch_seq_string(contig, 0, 1 << 30)
         .map_err(|e| format!("Cannot fetch contig {} from {}: {}", contig, ref_path, e))?;
     Ok(seq.into_bytes())
 }

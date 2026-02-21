@@ -112,8 +112,8 @@ pub fn build_haplotype_kmers(
 
     HaplotypeKmers {
         ref_kmers: ref_unique,
-        low_complexity,
         alt_kmers: alt_unique,
+        low_complexity,
     }
 }
 
