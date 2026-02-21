@@ -204,7 +204,7 @@ pub fn extract_kmers_with_qual_u128(
     k: usize,
     min_baseq: u8,
 ) -> Vec<u128> {
-    if seq.len() < k || k == 0 || k > 64 {
+    if seq.len() < k || k == 0 || k > 64 || seq.len() != qual.len() {
         return Vec::new();
     }
     let mask: u128 = if k == 64 { u128::MAX } else { (1u128 << (2 * k)) - 1 };
