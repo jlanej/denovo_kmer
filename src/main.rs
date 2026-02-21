@@ -4,7 +4,7 @@ use std::process;
 
 use kmer_denovo::filter;
 
-/// De novo variant filtering using k-mer evidence from trio WGS data
+/// Proband-unique k-mer annotation for de novo variant analysis in trio WGS data
 #[derive(Parser, Debug)]
 #[command(name = "kmer-denovo", version, about)]
 struct Cli {
@@ -24,7 +24,7 @@ struct Cli {
     #[arg(long, short = 'r')]
     ref_fasta: String,
 
-    /// Input VCF with candidate de novo variants
+    /// Input VCF with candidate variants
     #[arg(long)]
     vcf: String,
 
@@ -44,45 +44,17 @@ struct Cli {
     #[arg(long, default_value = "20")]
     min_baseq: u8,
 
-    /// Minimum mapping quality for reads
+    /// Minimum mapping quality for child reads
     #[arg(long, default_value = "20")]
     min_mapq: u8,
 
-    /// Maximum reads to sample per locus per sample
+    /// Maximum reads per locus
     #[arg(long, default_value = "200")]
     max_reads_per_locus: usize,
-
-    /// Number of threads
-    #[arg(long, short = 't', default_value = "1")]
-    threads: usize,
-
-    /// Minimum child ALT k-mer count
-    #[arg(long, default_value = "3")]
-    min_child_alt: u32,
-
-    /// Maximum parent ALT k-mer count
-    #[arg(long, default_value = "1")]
-    max_parent_alt: u32,
-
-    /// Minimum child ALT ratio: ALT / (REF + 1)
-    #[arg(long, default_value = "0.1")]
-    min_child_alt_ratio: f64,
-
-    /// Maximum variant size (bp) to process
-    #[arg(long, default_value = "50")]
-    max_variant_size: usize,
-
-    /// BED file to restrict processing regions
-    #[arg(long)]
-    regions: Option<String>,
 
     /// Enable per-variant debug output
     #[arg(long)]
     debug_kmers: bool,
-
-    /// Window size around variant for read fetching (bp)
-    #[arg(long, default_value = "500")]
-    window: usize,
 }
 
 fn main() {
@@ -94,7 +66,10 @@ fn main() {
         process::exit(1);
     }
     if cli.kmer_size < 11 || cli.kmer_size > 63 {
-        error!("K-mer size must be between 11 and 63, got {}", cli.kmer_size);
+        error!(
+            "K-mer size must be between 11 and 63, got {}",
+            cli.kmer_size
+        );
         process::exit(1);
     }
 
@@ -103,16 +78,11 @@ fn main() {
         min_baseq: cli.min_baseq,
         min_mapq: cli.min_mapq,
         max_reads_per_locus: cli.max_reads_per_locus,
-        min_child_alt: cli.min_child_alt,
-        max_parent_alt: cli.max_parent_alt,
-        min_child_alt_ratio: cli.min_child_alt_ratio,
-        max_variant_size: cli.max_variant_size,
-        window: cli.window,
         debug_kmers: cli.debug_kmers,
     };
 
-    info!("kmer-denovo filter v{}", env!("CARGO_PKG_VERSION"));
-    info!("K={}, threads={}", cli.kmer_size, cli.threads);
+    info!("kmer-denovo v{}", env!("CARGO_PKG_VERSION"));
+    info!("K={}", cli.kmer_size);
     info!("Child: {}", cli.child);
     info!("Mother: {}", cli.mother);
     info!("Father: {}", cli.father);
@@ -127,18 +97,11 @@ fn main() {
         &cli.vcf,
         &cli.output,
         &config,
-        cli.threads,
-        cli.regions.as_deref(),
     ) {
         Ok(summary) => {
-            info!("Filtering complete: {} variants processed", summary.total_variants);
             info!(
-                "  OK={}, NO_CHILD_ALT={}, PARENT_ALT={}, LOW_COMPLEXITY={}, NOT_IMPLEMENTED={}",
-                summary.dn_kmer_ok,
-                summary.dn_kmer_no_child_alt,
-                summary.dn_kmer_parent_alt,
-                summary.dn_kmer_low_complexity,
-                summary.dn_kmer_not_implemented,
+                "Complete: {} variants annotated",
+                summary.total_variants
             );
 
             if let Some(metrics_path) = &cli.metrics {
