@@ -36,7 +36,7 @@ struct Cli {
     #[arg(long)]
     metrics: Option<String>,
 
-    /// K-mer size (must be odd)
+    /// K-mer size (must be odd, max 32)
     #[arg(long, short = 'k', default_value = "31")]
     kmer_size: usize,
 
@@ -55,6 +55,10 @@ struct Cli {
     /// Enable per-variant debug output
     #[arg(long)]
     debug_kmers: bool,
+
+    /// Number of additional threads for BAM/CRAM decompression
+    #[arg(long, short = 't', default_value = "4")]
+    threads: usize,
 }
 
 fn main() {

@@ -7,6 +7,7 @@
 /// 4. Annotate as KMER_PROBAND_UNIQUE.
 use ahash::AHashSet;
 use log::{debug, info, warn};
+use rayon::prelude::*;
 use std::time::Instant;
 
 use crate::counter;
@@ -21,12 +22,13 @@ pub struct FilterConfig {
     pub min_mapq: u8,
     pub max_reads_per_locus: usize,
     pub debug_kmers: bool,
+    pub threads: usize,
 }
 
-/// Per-variant child read k-mers.
+/// Per-variant child read k-mers (u64-encoded).
 struct VariantReadKmers {
     record_idx: usize,
-    per_read_kmers: Vec<AHashSet<Vec<u8>>>,
+    per_read_kmers: Vec<AHashSet<u64>>,
 }
 
 /// Main pipeline entry point.
@@ -70,6 +72,7 @@ pub fn run_filter(
             config.min_mapq,
             config.min_baseq,
             config.max_reads_per_locus,
+            config.threads,
         )
         .unwrap_or_else(|e| {
             warn!(
@@ -88,37 +91,46 @@ pub fn run_filter(
     }
 
     // 3. Collect all child k-mers for parent scanning
-    let all_child_kmers: AHashSet<Vec<u8>> = variant_read_kmers
+    let all_child_kmers: AHashSet<u64> = variant_read_kmers
         .iter()
-        .flat_map(|vrk| vrk.per_read_kmers.iter().flat_map(|s| s.iter().cloned()))
+        .flat_map(|vrk| vrk.per_read_kmers.iter().flat_map(|s| s.iter().copied()))
         .collect();
     info!(
         "Collected {} distinct child k-mers for parent scanning",
         all_child_kmers.len()
     );
 
-    // 4. Scan each parent's entire BAM/CRAM
-    info!("Scanning mother BAM/CRAM (whole-file)...");
-    let mother_kmers = counter::count_kmers_whole_file(
-        mother_bam,
-        ref_path,
-        &all_child_kmers,
-        config.kmer_size,
-        config.min_baseq,
-    )?;
+    // 4. Scan each parent's entire BAM/CRAM in parallel
+    info!("Scanning parent BAM/CRAM files (whole-file, parallel)...");
+    let (mother_result, father_result) = rayon::join(
+        || {
+            counter::count_kmers_whole_file(
+                mother_bam,
+                ref_path,
+                &all_child_kmers,
+                config.kmer_size,
+                config.min_baseq,
+                config.threads,
+            )
+        },
+        || {
+            counter::count_kmers_whole_file(
+                father_bam,
+                ref_path,
+                &all_child_kmers,
+                config.kmer_size,
+                config.min_baseq,
+                config.threads,
+            )
+        },
+    );
+
+    let mother_kmers = mother_result?;
     info!(
         "Mother scan: found {} distinct child k-mers",
         mother_kmers.len()
     );
-
-    info!("Scanning father BAM/CRAM (whole-file)...");
-    let father_kmers = counter::count_kmers_whole_file(
-        father_bam,
-        ref_path,
-        &all_child_kmers,
-        config.kmer_size,
-        config.min_baseq,
-    )?;
+    let father_kmers = father_result?;
     info!(
         "Father scan: found {} distinct child k-mers",
         father_kmers.len()
