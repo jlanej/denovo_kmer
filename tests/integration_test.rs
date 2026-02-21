@@ -163,6 +163,7 @@ fn test_denovo_proband_unique_reads() {
         min_mapq: 20,
         max_reads_per_locus: 200,
         debug_kmers: true,
+        threads: 1,
     };
 
     let summary = kmer_denovo::filter::run_filter(
@@ -173,6 +174,8 @@ fn test_denovo_proband_unique_reads() {
         &vcf_path,
         &output_path,
         &config,
+        None,
+        None,
     )
     .unwrap();
 
@@ -233,6 +236,7 @@ fn test_inherited_zero_proband_unique() {
         min_mapq: 20,
         max_reads_per_locus: 200,
         debug_kmers: false,
+        threads: 1,
     };
 
     let summary = kmer_denovo::filter::run_filter(
@@ -243,6 +247,8 @@ fn test_inherited_zero_proband_unique() {
         &vcf_path,
         &output_path,
         &config,
+        None,
+        None,
     )
     .unwrap();
 
@@ -301,6 +307,7 @@ fn test_mismapped_parent_detected() {
         min_mapq: 20,
         max_reads_per_locus: 200,
         debug_kmers: true,
+        threads: 1,
     };
 
     let summary = kmer_denovo::filter::run_filter(
@@ -311,6 +318,8 @@ fn test_mismapped_parent_detected() {
         &vcf_path,
         &output_path,
         &config,
+        None,
+        None,
     )
     .unwrap();
 

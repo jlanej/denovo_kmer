@@ -113,11 +113,14 @@ pub fn extract_kmers_with_qual(seq: &[u8], qual: &[u8], k: usize, min_baseq: u8)
     extract_kmers(&masked, k)
 }
 
-// --- Compact u64-encoded k-mer operations (k ≤ 32) ---
+// --- Compact u128-encoded k-mer operations (k ≤ 64) ---
+//
+// Inspired by Jellyfish's 2-bit encoding: A=0, C=1, G=2, T=3.
+// Using u128 allows k-mers up to 64 bases (128 bits / 2 bits per base).
 
 /// Encode a single DNA base as a 2-bit value. Returns None for non-ACGT bases.
 #[inline]
-pub fn encode_base(base: u8) -> Option<u64> {
+pub fn encode_base(base: u8) -> Option<u128> {
     match base {
         b'A' | b'a' => Some(0),
         b'C' | b'c' => Some(1),
@@ -127,46 +130,55 @@ pub fn encode_base(base: u8) -> Option<u64> {
     }
 }
 
-/// Compute the reverse complement of a u64-encoded k-mer of length k.
+/// Compute the reverse complement of a u128-encoded k-mer of length k.
+///
+/// Uses Jellyfish-style bit-parallel reversal: complement all 2-bit pairs,
+/// then reverse their order within the 128-bit word.
 #[inline]
-pub fn revcomp_u64(val: u64, k: usize) -> u64 {
+pub fn revcomp_u128(val: u128, k: usize) -> u128 {
     // Complement: XOR all 2-bit pairs with 0b11
     let mut rc = !val;
-    // Reverse 2-bit pairs using parallel swap
-    rc = ((rc >> 2) & 0x3333_3333_3333_3333) | ((rc & 0x3333_3333_3333_3333) << 2);
-    rc = ((rc >> 4) & 0x0F0F_0F0F_0F0F_0F0F) | ((rc & 0x0F0F_0F0F_0F0F_0F0F) << 4);
-    rc = ((rc >> 8) & 0x00FF_00FF_00FF_00FF) | ((rc & 0x00FF_00FF_00FF_00FF) << 8);
-    rc = ((rc >> 16) & 0x0000_FFFF_0000_FFFF) | ((rc & 0x0000_FFFF_0000_FFFF) << 16);
-    rc = (rc >> 32) | (rc << 32);
+    // Reverse 2-bit pairs using parallel swap at each power-of-2 stride
+    rc = ((rc >> 2) & 0x33333333_33333333_33333333_33333333)
+        | ((rc & 0x33333333_33333333_33333333_33333333) << 2);
+    rc = ((rc >> 4) & 0x0F0F0F0F_0F0F0F0F_0F0F0F0F_0F0F0F0F)
+        | ((rc & 0x0F0F0F0F_0F0F0F0F_0F0F0F0F_0F0F0F0F) << 4);
+    rc = ((rc >> 8) & 0x00FF00FF_00FF00FF_00FF00FF_00FF00FF)
+        | ((rc & 0x00FF00FF_00FF00FF_00FF00FF_00FF00FF) << 8);
+    rc = ((rc >> 16) & 0x0000FFFF_0000FFFF_0000FFFF_0000FFFF)
+        | ((rc & 0x0000FFFF_0000FFFF_0000FFFF_0000FFFF) << 16);
+    rc = ((rc >> 32) & 0x00000000_FFFFFFFF_00000000_FFFFFFFF)
+        | ((rc & 0x00000000_FFFFFFFF_00000000_FFFFFFFF) << 32);
+    rc = (rc >> 64) | (rc << 64);
     // Shift right to align the k bases in the lower 2k bits
-    rc >> (64 - 2 * k)
+    rc >> (128 - 2 * k)
 }
 
-/// Compute the canonical (min of forward and revcomp) u64-encoded k-mer.
+/// Compute the canonical (min of forward and revcomp) u128-encoded k-mer.
 #[inline]
-pub fn canonical_kmer_u64(val: u64, k: usize) -> u64 {
-    val.min(revcomp_u64(val, k))
+pub fn canonical_kmer_u128(val: u128, k: usize) -> u128 {
+    val.min(revcomp_u128(val, k))
 }
 
-/// Encode a k-mer slice as a canonical u64 value. Returns None if any base is non-ACGT.
+/// Encode a k-mer slice as a canonical u128 value. Returns None if any base is non-ACGT.
 #[inline]
-pub fn encode_kmer_canonical(seq: &[u8], k: usize) -> Option<u64> {
-    let mut val = 0u64;
+pub fn encode_kmer_canonical(seq: &[u8], k: usize) -> Option<u128> {
+    let mut val = 0u128;
     for &b in seq {
         val = (val << 2) | encode_base(b)?;
     }
-    Some(canonical_kmer_u64(val, k))
+    Some(canonical_kmer_u128(val, k))
 }
 
-/// Extract canonical k-mers as u64 from a sequence using a rolling window.
-/// Requires k ≤ 32. Skips windows containing non-ACGT bases.
-pub fn extract_kmers_u64(seq: &[u8], k: usize) -> Vec<u64> {
-    if seq.len() < k || k == 0 || k > 32 {
+/// Extract canonical k-mers as u128 from a sequence using a rolling window.
+/// Requires k ≤ 64. Skips windows containing non-ACGT bases.
+pub fn extract_kmers_u128(seq: &[u8], k: usize) -> Vec<u128> {
+    if seq.len() < k || k == 0 || k > 64 {
         return Vec::new();
     }
-    let mask: u64 = if k == 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 };
+    let mask: u128 = if k == 64 { u128::MAX } else { (1u128 << (2 * k)) - 1 };
     let mut result = Vec::with_capacity(seq.len() - k + 1);
-    let mut fwd: u64 = 0;
+    let mut fwd: u128 = 0;
     let mut valid_run: usize = 0;
 
     for &base in seq {
@@ -178,26 +190,26 @@ pub fn extract_kmers_u64(seq: &[u8], k: usize) -> Vec<u64> {
             fwd = 0;
         }
         if valid_run >= k {
-            result.push(canonical_kmer_u64(fwd, k));
+            result.push(canonical_kmer_u128(fwd, k));
         }
     }
     result
 }
 
-/// Extract canonical k-mers as u64 with base quality filtering.
+/// Extract canonical k-mers as u128 with base quality filtering.
 /// Bases below min_baseq are treated as invalid (like N), breaking the k-mer window.
-pub fn extract_kmers_with_qual_u64(
+pub fn extract_kmers_with_qual_u128(
     seq: &[u8],
     qual: &[u8],
     k: usize,
     min_baseq: u8,
-) -> Vec<u64> {
-    if seq.len() < k || k == 0 || k > 32 {
+) -> Vec<u128> {
+    if seq.len() < k || k == 0 || k > 64 {
         return Vec::new();
     }
-    let mask: u64 = if k == 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 };
+    let mask: u128 = if k == 64 { u128::MAX } else { (1u128 << (2 * k)) - 1 };
     let mut result = Vec::with_capacity(seq.len() - k + 1);
-    let mut fwd: u64 = 0;
+    let mut fwd: u128 = 0;
     let mut valid_run: usize = 0;
 
     for (i, &base) in seq.iter().enumerate() {
@@ -214,7 +226,7 @@ pub fn extract_kmers_with_qual_u64(
             fwd = 0;
         }
         if valid_run >= k {
-            result.push(canonical_kmer_u64(fwd, k));
+            result.push(canonical_kmer_u128(fwd, k));
         }
     }
     result
@@ -309,71 +321,79 @@ mod tests {
         assert_eq!(extract_kmers(b"ACG", 5).len(), 0);
     }
 
-    // --- u64-encoded k-mer tests ---
+    // --- u128-encoded k-mer tests ---
 
     #[test]
-    fn test_revcomp_u64() {
+    fn test_revcomp_u128() {
         // ACGT (A=0,C=1,G=2,T=3) => 0b00_01_10_11 = 0x1B
         // revcomp(ACGT) = ACGT (palindrome)
-        let fwd = 0b00_01_10_11u64; // ACGT
-        assert_eq!(revcomp_u64(fwd, 4), fwd);
+        let fwd = 0b00_01_10_11u128; // ACGT
+        assert_eq!(revcomp_u128(fwd, 4), fwd);
 
         // AAAA = 0b00_00_00_00 = 0
         // revcomp(AAAA) = TTTT = 0b11_11_11_11 = 0xFF
-        assert_eq!(revcomp_u64(0, 4), 0xFF);
+        assert_eq!(revcomp_u128(0, 4), 0xFF);
     }
 
     #[test]
-    fn test_canonical_kmer_u64_palindrome() {
+    fn test_canonical_kmer_u128_palindrome() {
         // ACGT is a palindrome, canonical should equal forward
-        let fwd = 0b00_01_10_11u64;
-        assert_eq!(canonical_kmer_u64(fwd, 4), fwd);
+        let fwd = 0b00_01_10_11u128;
+        assert_eq!(canonical_kmer_u128(fwd, 4), fwd);
     }
 
     #[test]
-    fn test_extract_kmers_u64_matches_vec() {
-        // Verify u64 and Vec<u8> implementations produce the same number of k-mers
+    fn test_extract_kmers_u128_matches_vec() {
+        // Verify u128 and Vec<u8> implementations produce the same number of k-mers
         let seq = b"ACGTACGT";
         let k = 4;
         let vec_kmers = extract_kmers(seq, k);
-        let u64_kmers = extract_kmers_u64(seq, k);
-        assert_eq!(vec_kmers.len(), u64_kmers.len());
+        let u128_kmers = extract_kmers_u128(seq, k);
+        assert_eq!(vec_kmers.len(), u128_kmers.len());
     }
 
     #[test]
-    fn test_extract_kmers_u64_with_n() {
+    fn test_extract_kmers_u128_with_n() {
         let seq = b"ACNGTAC";
-        let kmers = extract_kmers_u64(seq, 3);
+        let kmers = extract_kmers_u128(seq, 3);
         // Same as Vec version: positions ACN, CNG, NGT skipped; GTA and TAC valid
         assert_eq!(kmers.len(), 2);
     }
 
     #[test]
-    fn test_extract_kmers_u64_empty() {
-        assert_eq!(extract_kmers_u64(b"", 5).len(), 0);
-        assert_eq!(extract_kmers_u64(b"ACG", 5).len(), 0);
+    fn test_extract_kmers_u128_empty() {
+        assert_eq!(extract_kmers_u128(b"", 5).len(), 0);
+        assert_eq!(extract_kmers_u128(b"ACG", 5).len(), 0);
     }
 
     #[test]
-    fn test_extract_kmers_with_qual_u64() {
+    fn test_extract_kmers_with_qual_u128() {
         let seq = b"ACGTACGT";
         let qual = vec![30, 30, 30, 5, 30, 30, 30, 30];
-        let kmers = extract_kmers_with_qual_u64(seq, &qual, 4, 20);
+        let kmers = extract_kmers_with_qual_u128(seq, &qual, 4, 20);
         // Same as Vec version: position 3 masked, only 1 k-mer at position 4
         assert_eq!(kmers.len(), 1);
     }
 
     #[test]
-    fn test_u64_canonical_consistency() {
-        // Verify that the u64 canonical form of a sequence and its reverse complement
+    fn test_u128_canonical_consistency() {
+        // Verify that the u128 canonical form of a sequence and its reverse complement
         // produce the same value
         let seq = b"GATTACA";
         let rc = b"TGTAATC";
         let k = 7;
-        let fwd_kmers = extract_kmers_u64(seq, k);
-        let rc_kmers = extract_kmers_u64(rc, k);
+        let fwd_kmers = extract_kmers_u128(seq, k);
+        let rc_kmers = extract_kmers_u128(rc, k);
         assert_eq!(fwd_kmers.len(), 1);
         assert_eq!(rc_kmers.len(), 1);
         assert_eq!(fwd_kmers[0], rc_kmers[0], "Canonical form should be identical for seq and its revcomp");
+    }
+
+    #[test]
+    fn test_u128_large_k() {
+        // Test with k=33 which exceeds u64 range but fits in u128
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"; // 40 bases
+        let kmers = extract_kmers_u128(seq, 33);
+        assert_eq!(kmers.len(), 40 - 33 + 1);
     }
 }

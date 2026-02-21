@@ -2,15 +2,16 @@
 ///
 /// For each variant:
 /// 1. Extract k-mers from child reads that overlap the variant position.
-/// 2. Scan parent BAM/CRAM files for those k-mers (whole-file, aligner-agnostic).
+/// 2. Scan parent BAM/CRAM files for those k-mers (whole-file, aligner-agnostic),
+///    or load pre-built k-mer databases from disk.
 /// 3. Count child reads with at least one k-mer not found in either parent.
 /// 4. Annotate as KMER_PROBAND_UNIQUE.
 use ahash::AHashSet;
 use log::{debug, info, warn};
-use rayon::prelude::*;
 use std::time::Instant;
 
 use crate::counter;
+use crate::kmer_db::KmerDb;
 use crate::metrics::FilterSummary;
 use crate::vcf_io::{self, VariantAnnotation};
 
@@ -25,10 +26,10 @@ pub struct FilterConfig {
     pub threads: usize,
 }
 
-/// Per-variant child read k-mers (u64-encoded).
+/// Per-variant child read k-mers (u128-encoded).
 struct VariantReadKmers {
     record_idx: usize,
-    per_read_kmers: Vec<AHashSet<u64>>,
+    per_read_kmers: Vec<AHashSet<u128>>,
 }
 
 /// Main pipeline entry point.
@@ -40,6 +41,8 @@ pub fn run_filter(
     vcf_path: &str,
     output_path: &str,
     config: &FilterConfig,
+    mother_db_path: Option<&str>,
+    father_db_path: Option<&str>,
 ) -> Result<FilterSummary, Box<dyn std::error::Error>> {
     let start_time = Instant::now();
 
@@ -91,7 +94,7 @@ pub fn run_filter(
     }
 
     // 3. Collect all child k-mers for parent scanning
-    let all_child_kmers: AHashSet<u64> = variant_read_kmers
+    let all_child_kmers: AHashSet<u128> = variant_read_kmers
         .iter()
         .flat_map(|vrk| vrk.per_read_kmers.iter().flat_map(|s| s.iter().copied()))
         .collect();
@@ -100,41 +103,23 @@ pub fn run_filter(
         all_child_kmers.len()
     );
 
-    // 4. Scan each parent's entire BAM/CRAM in parallel
-    info!("Scanning parent BAM/CRAM files (whole-file, parallel)...");
-    let (mother_result, father_result) = rayon::join(
-        || {
-            counter::count_kmers_whole_file(
-                mother_bam,
-                ref_path,
-                &all_child_kmers,
-                config.kmer_size,
-                config.min_baseq,
-                config.threads,
-            )
-        },
-        || {
-            counter::count_kmers_whole_file(
-                father_bam,
-                ref_path,
-                &all_child_kmers,
-                config.kmer_size,
-                config.min_baseq,
-                config.threads,
-            )
-        },
-    );
-
-    let mother_kmers = mother_result?;
-    info!(
-        "Mother scan: found {} distinct child k-mers",
-        mother_kmers.len()
-    );
-    let father_kmers = father_result?;
-    info!(
-        "Father scan: found {} distinct child k-mers",
-        father_kmers.len()
-    );
+    // 4. Load or scan parent k-mer databases
+    let mother_db = load_or_scan_parent(
+        "mother",
+        mother_bam,
+        ref_path,
+        mother_db_path,
+        &all_child_kmers,
+        config,
+    )?;
+    let father_db = load_or_scan_parent(
+        "father",
+        father_bam,
+        ref_path,
+        father_db_path,
+        &all_child_kmers,
+        config,
+    )?;
 
     // 5. Count proband-unique reads per variant
     info!("Computing proband-unique read counts...");
@@ -147,7 +132,7 @@ pub fn run_filter(
             .filter(|read_kmers| {
                 read_kmers
                     .iter()
-                    .any(|km| !mother_kmers.contains_key(km) && !father_kmers.contains_key(km))
+                    .any(|km| !mother_db.contains(*km) && !father_db.contains(*km))
             })
             .count() as i32;
 
@@ -180,4 +165,81 @@ pub fn run_filter(
     vcf_io::write_annotated_vcf(vcf_path, output_path, &annotations)?;
 
     Ok(summary)
+}
+
+/// Load a pre-built parent k-mer database from disk, or scan the BAM file.
+///
+/// If `db_path` is provided:
+///   - If the file exists, load the database from disk (avoiding a BAM scan).
+///   - If the file does not exist, scan the BAM, build the database, and save it.
+/// If `db_path` is None, perform a targeted scan for only the child k-mers.
+fn load_or_scan_parent(
+    label: &str,
+    bam_path: &str,
+    ref_path: &str,
+    db_path: Option<&str>,
+    target_kmers: &AHashSet<u128>,
+    config: &FilterConfig,
+) -> Result<KmerDb, Box<dyn std::error::Error>> {
+    match db_path {
+        Some(path) if std::path::Path::new(path).exists() => {
+            info!("Loading {} k-mer database from {}", label, path);
+            let db = KmerDb::load(path)?;
+            info!(
+                "{} database: loaded {} k-mers (k={})",
+                label,
+                db.len(),
+                db.kmer_size()
+            );
+            if db.kmer_size() != config.kmer_size {
+                return Err(format!(
+                    "{} database k-mer size ({}) does not match config ({})",
+                    label,
+                    db.kmer_size(),
+                    config.kmer_size
+                )
+                .into());
+            }
+            Ok(db)
+        }
+        Some(path) => {
+            info!(
+                "Building {} k-mer database (whole-file scan) and saving to {}",
+                label, path
+            );
+            let counts = counter::count_all_kmers_whole_file(
+                bam_path,
+                ref_path,
+                config.kmer_size,
+                config.min_baseq,
+                config.threads,
+            )?;
+            info!(
+                "{} scan complete: {} distinct k-mers",
+                label,
+                counts.len()
+            );
+            let db = KmerDb::from_counts(config.kmer_size, counts);
+            db.save(path)?;
+            info!("{} database saved to {}", label, path);
+            Ok(db)
+        }
+        None => {
+            info!("Scanning {} BAM/CRAM (whole-file, targeted)...", label);
+            let counts = counter::count_kmers_whole_file(
+                bam_path,
+                ref_path,
+                target_kmers,
+                config.kmer_size,
+                config.min_baseq,
+                config.threads,
+            )?;
+            info!(
+                "{} scan: found {} distinct child k-mers",
+                label,
+                counts.len()
+            );
+            Ok(KmerDb::from_counts(config.kmer_size, counts))
+        }
+    }
 }
