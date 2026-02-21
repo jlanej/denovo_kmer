@@ -3,6 +3,7 @@
 /// These tests create small synthetic BAM files with reads containing known variants,
 /// and verify that the filtering pipeline correctly classifies them.
 use rust_htslib::bam::{self, header, Header, Writer};
+use rust_htslib::bcf::{self, Read as BcfRead};
 use std::io::Write;
 use tempfile::TempDir;
 
@@ -399,5 +400,152 @@ fn test_mismapped_parent_detected() {
         summary.dn_kmer_parent_alt, 1,
         "Expected DN_KMER_PARENT_ALT: whole-file scan should find ALT k-mers \
          in mother even though her reads are mapped to a different position"
+    );
+}
+
+#[test]
+fn test_proband_unique_annotation() {
+    // Scenario: Child has ALT reads that parents don't have, so the output VCF
+    // should contain KMER_PROBAND_UNIQUE > 0.
+    let dir = TempDir::new().unwrap();
+    let ref_path = create_reference(dir.path());
+
+    // Child: 10 reads with ALT, 10 with REF
+    let child_reads = make_reads_with_alt(20, 10);
+    let child_reads_ref: Vec<(i64, &[u8])> =
+        child_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
+    let child_bam = create_bam(dir.path(), "child", &ref_path, &child_reads_ref);
+
+    // Mother: 20 reads all REF
+    let mother_reads = make_reads_with_alt(20, 0);
+    let mother_reads_ref: Vec<(i64, &[u8])> =
+        mother_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
+    let mother_bam = create_bam(dir.path(), "mother", &ref_path, &mother_reads_ref);
+
+    // Father: 20 reads all REF
+    let father_reads = make_reads_with_alt(20, 0);
+    let father_reads_ref: Vec<(i64, &[u8])> =
+        father_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
+    let father_bam = create_bam(dir.path(), "father", &ref_path, &father_reads_ref);
+
+    let vcf_path = create_vcf(dir.path(), &ref_path);
+    let output_path = dir.path().join("output.vcf").to_str().unwrap().to_string();
+
+    let config = kmer_denovo::filter::FilterConfig {
+        kmer_size: 21,
+        min_baseq: 20,
+        min_mapq: 20,
+        max_reads_per_locus: 200,
+        min_child_alt: 3,
+        max_parent_alt: 1,
+        min_child_alt_ratio: 0.1,
+        max_variant_size: 50,
+        window: 500,
+        debug_kmers: true,
+    };
+
+    let summary = kmer_denovo::filter::run_filter(
+        &child_bam,
+        &mother_bam,
+        &father_bam,
+        &ref_path,
+        &vcf_path,
+        &output_path,
+        &config,
+        1,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(summary.total_variants, 1);
+    assert_eq!(summary.dn_kmer_ok, 1);
+
+    // Read back the output VCF and verify KMER_PROBAND_UNIQUE is present and > 0
+    let mut reader = bcf::Reader::from_path(&output_path).unwrap();
+    let mut record = reader.empty_record();
+    let _ = reader.read(&mut record).unwrap();
+    let proband_unique = record
+        .info(b"KMER_PROBAND_UNIQUE")
+        .integer()
+        .unwrap()
+        .unwrap()[0];
+    assert!(
+        proband_unique > 0,
+        "Expected KMER_PROBAND_UNIQUE > 0 for de novo variant with ALT reads in child only, got {}",
+        proband_unique
+    );
+}
+
+#[test]
+fn test_proband_unique_zero_for_inherited() {
+    // Scenario: Both child and mother have the same ALT reads, so
+    // the child's k-mers should mostly be found in the mother.
+    // KMER_PROBAND_UNIQUE should be 0 or very low.
+    let dir = TempDir::new().unwrap();
+    let ref_path = create_reference(dir.path());
+
+    // Child: 10 reads with ALT
+    let child_reads = make_reads_with_alt(20, 10);
+    let child_reads_ref: Vec<(i64, &[u8])> =
+        child_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
+    let child_bam = create_bam(dir.path(), "child", &ref_path, &child_reads_ref);
+
+    // Mother: same reads as child (inherited variant)
+    let mother_reads = make_reads_with_alt(20, 10);
+    let mother_reads_ref: Vec<(i64, &[u8])> =
+        mother_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
+    let mother_bam = create_bam(dir.path(), "mother", &ref_path, &mother_reads_ref);
+
+    // Father: all REF
+    let father_reads = make_reads_with_alt(20, 0);
+    let father_reads_ref: Vec<(i64, &[u8])> =
+        father_reads.iter().map(|(p, s)| (*p, s.as_slice())).collect();
+    let father_bam = create_bam(dir.path(), "father", &ref_path, &father_reads_ref);
+
+    let vcf_path = create_vcf(dir.path(), &ref_path);
+    let output_path = dir.path().join("output.vcf").to_str().unwrap().to_string();
+
+    let config = kmer_denovo::filter::FilterConfig {
+        kmer_size: 21,
+        min_baseq: 20,
+        min_mapq: 20,
+        max_reads_per_locus: 200,
+        min_child_alt: 3,
+        max_parent_alt: 1,
+        min_child_alt_ratio: 0.1,
+        max_variant_size: 50,
+        window: 500,
+        debug_kmers: false,
+    };
+
+    let summary = kmer_denovo::filter::run_filter(
+        &child_bam,
+        &mother_bam,
+        &father_bam,
+        &ref_path,
+        &vcf_path,
+        &output_path,
+        &config,
+        1,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(summary.total_variants, 1);
+    assert_eq!(summary.dn_kmer_parent_alt, 1);
+
+    // Read back the output VCF
+    let mut reader = bcf::Reader::from_path(&output_path).unwrap();
+    let mut record = reader.empty_record();
+    let _ = reader.read(&mut record).unwrap();
+    let proband_unique = record
+        .info(b"KMER_PROBAND_UNIQUE")
+        .integer()
+        .unwrap()
+        .unwrap()[0];
+    assert_eq!(
+        proband_unique, 0,
+        "Expected KMER_PROBAND_UNIQUE == 0 for inherited variant (same reads in child and mother), got {}",
+        proband_unique
     );
 }
