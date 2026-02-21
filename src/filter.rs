@@ -218,8 +218,10 @@ fn load_reference_contig(
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let reader = rust_htslib::faidx::Reader::from_path(ref_path)
         .map_err(|e| format!("Cannot open reference {}: {}", ref_path, e))?;
+    // Fetch the whole contig. Using a very large end position is fine;
+    // htslib will clamp to the actual contig length.
     let seq = reader
-        .fetch_seq_string(contig, 0, usize::MAX - 1)
+        .fetch_seq_string(contig, 0, i64::MAX as usize / 2)
         .map_err(|e| format!("Cannot fetch contig {} from {}: {}", contig, ref_path, e))?;
     Ok(seq.into_bytes())
 }
@@ -340,10 +342,8 @@ pub fn run_filter(
 
     let errs = errors.into_inner().unwrap();
     if !errs.is_empty() {
-        for e in &errs {
-            log::error!("{}", e);
-        }
-        return Err(format!("{} contig(s) failed to process", errs.len()).into());
+        let msg = errs.join("; ");
+        return Err(format!("{} contig(s) failed to process: {}", errs.len(), msg).into());
     }
 
     let mut anns = annotations.into_inner().unwrap();

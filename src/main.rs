@@ -2,12 +2,7 @@ use clap::Parser;
 use log::{error, info};
 use std::process;
 
-mod counter;
-mod filter;
-mod haplotype;
-mod kmer;
-mod metrics;
-mod vcf_io;
+use kmer_denovo::filter;
 
 /// De novo variant filtering using k-mer evidence from trio WGS data
 #[derive(Parser, Debug)]
