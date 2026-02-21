@@ -9,7 +9,7 @@ use crate::kmer;
 ///
 /// For each read overlapping the variant, extracts only the canonical k-mers
 /// whose genomic span includes the variant position. Returns one set per read.
-/// K-mers are encoded as u128 values using 2-bit encoding (supports k ≤ 64).
+/// K-mers are encoded as u128 values using 2-bit encoding (supports k up to 64).
 pub fn extract_reads_kmers_at_variant(
     bam_path: &str,
     ref_path: &str,

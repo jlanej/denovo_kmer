@@ -1,7 +1,7 @@
 /// K-mer operations: encoding, canonicalization, reverse complement, complexity checks.
 ///
-/// K-mers are encoded as u64 values using 2-bit encoding (A=0, C=1, G=2, T=3),
-/// supporting k-mer sizes up to 32. Canonical form is the lexicographically smaller
+/// K-mers are encoded as u128 values using 2-bit encoding (A=0, C=1, G=2, T=3),
+/// supporting k-mer sizes up to 64. Canonical form is the lexicographically smaller
 /// of the k-mer and its reverse complement.
 
 /// Complement a single DNA base.
@@ -113,7 +113,7 @@ pub fn extract_kmers_with_qual(seq: &[u8], qual: &[u8], k: usize, min_baseq: u8)
     extract_kmers(&masked, k)
 }
 
-// --- Compact u128-encoded k-mer operations (k ≤ 64) ---
+// --- Compact u128-encoded k-mer operations (k <= 64) ---
 //
 // Inspired by Jellyfish's 2-bit encoding: A=0, C=1, G=2, T=3.
 // Using u128 allows k-mers up to 64 bases (128 bits / 2 bits per base).
@@ -171,7 +171,7 @@ pub fn encode_kmer_canonical(seq: &[u8], k: usize) -> Option<u128> {
 }
 
 /// Extract canonical k-mers as u128 from a sequence using a rolling window.
-/// Requires k ≤ 64. Skips windows containing non-ACGT bases.
+/// Requires k <= 64. Skips windows containing non-ACGT bases.
 pub fn extract_kmers_u128(seq: &[u8], k: usize) -> Vec<u128> {
     if seq.len() < k || k == 0 || k > 64 {
         return Vec::new();
